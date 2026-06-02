@@ -24,11 +24,11 @@ MODEL_PATH = "./yolov8n.pt"
 # 车辆类别 ID（COCO 数据集中：2=轿车, 5=大巴, 7=货车）
 VEHICLE_CLASS_IDS = [2, 5, 7]
 
-# ----- 测速线参数 -----
-# 上方测速线的 Y 坐标（像素）
-LINE_Y_TOP = 100
-# 下方测速线的 Y 坐标（像素）
-LINE_Y_BOT = 250
+# ----- 测速线参数（竖直线，车辆水平穿越） -----
+# 左侧测速线的 X 坐标（像素）
+LINE_X_LEFT = 150
+# 右侧测速线的 X 坐标（像素）
+LINE_X_RIGHT = 400
 # 测速线颜色（蓝色 BGR）
 LINE_COLOR = (255, 0, 0)
 # 测速线粗细
@@ -38,7 +38,7 @@ LINE_THICKNESS = 2
 # 两条测速线之间的实际距离（米）
 REAL_DISTANCE_M = 30.0
 # 两条测速线之间的像素距离（根据实际视频调整）
-PIXEL_DISTANCE = abs(LINE_Y_BOT - LINE_Y_TOP)
+PIXEL_DISTANCE = abs(LINE_X_RIGHT - LINE_X_LEFT)
 
 # ----- 热力图参数 -----
 # 热力图衰减系数（0~1，越大衰减越慢，保留历史越久）
@@ -107,47 +107,38 @@ from ultralytics import YOLO
 # ============================================================
 class VehicleTracker:
     """
-    跟踪车辆穿越两条测速线的过程，计算车速。
-    使用中心点匹配的方式实现简易多目标跟踪。
+    基于位移的车辆测速器。
+    跟踪车辆中心点位置，当像素位移超过阈值后计算瞬时车速。
+    适用于任意行驶方向（水平/垂直/斜向）。
     """
 
+    # 像素/米 换算系数（经验值：1.5m摄像头高度，1000等效焦距）
+    PX_PER_M = 1000.0 / 150.0
+    # 最少跟踪帧数（防止单帧噪声）
+    MIN_TRACK_FRAMES = 10
+    # 最小位移（像素），低于此不计算速度
+    MIN_DISPLACEMENT = 5
+
     def __init__(self):
-        # 记录每辆车经过上方线的时间 {track_id: timestamp}
-        self.pass_time_top = {}
-        # 记录每辆车经过下方线的时间 {track_id: timestamp}
-        self.pass_time_bot = {}
-        # 已计算出的车速 {track_id: speed_kmh}
-        self.speeds = {}
-        # 自增 ID 分配器
+        self.speeds = {}          # {track_id: speed_kmh}  已确认车速
         self._next_id = 0
-        # 上一帧的质心列表 [(cx, cy, id), ...]
         self._prev_centroids = []
-        # 最大匹配距离（像素）
-        self._max_match_dist = 80
+        self._max_match_dist = 30
+        # 每辆车的跟踪轨迹 {tid: {'start_cx', 'start_cy', 'start_frame', 'last_cx', 'last_cy', 'frames'}}
+        self._track_data = {}
+        self._current_frame = 0
 
     def _assign_ids(self, detections):
-        """
-        简易质心匹配跟踪：根据距离将当前帧检测框与上一帧关联。
-        detections: [(cx, cy, class_name), ...]
-        返回: [(cx, cy, class_name, track_id), ...]
-        """
         if not detections:
             self._prev_centroids = []
             return []
-
         current_pts = np.array([(d[0], d[1]) for d in detections])
         prev_pts = np.array([(p[0], p[1]) for p in self._prev_centroids]) if self._prev_centroids else np.empty((0, 2))
-
         assigned = []
         used_prev = set()
         used_curr = set()
-
         if len(prev_pts) > 0:
-            # 计算距离矩阵
-            dists = np.linalg.norm(
-                current_pts[:, np.newaxis, :] - prev_pts[np.newaxis, :, :], axis=2
-            )
-            # 贪心匹配：每次选最小距离
+            dists = np.linalg.norm(current_pts[:, np.newaxis, :] - prev_pts[np.newaxis, :, :], axis=2)
             for _ in range(min(len(current_pts), len(prev_pts))):
                 min_val = np.inf
                 ci, pi = -1, -1
@@ -167,63 +158,77 @@ class VehicleTracker:
                 assigned.append((cx, cy, cls_name, tid))
                 used_curr.add(ci)
                 used_prev.add(pi)
-
-        # 未匹配的检测分配新 ID
         for i, (cx, cy, cls_name) in enumerate(detections):
             if i not in used_curr:
                 assigned.append((cx, cy, cls_name, self._next_id))
                 self._next_id += 1
-
-        # 更新上一帧质心
         self._prev_centroids = [(cx, cy, tid) for cx, cy, _, tid in assigned]
         return assigned
 
-    def update(self, detections):
+    def update(self, tracked, fps=24.0):
         """
-        更新跟踪状态，检测车辆是否穿越测速线并计算速度。
-        detections: [(cx, cy, class_name), ...]
+        根据跟踪结果更新速度。
+        tracked: [(cx, cy, cls_name, track_id), ...]
         返回: {track_id: speed_kmh}  本帧新计算出的车速
         """
-        tracked = self._assign_ids(detections)
+        self._current_frame += 1
         new_speeds = {}
-        now = time.time()
+        active_tids = set()
 
         for cx, cy, cls_name, tid in tracked:
-            if abs(cy - LINE_Y_TOP) < 15:
-                if tid not in self.pass_time_top:
-                    self.pass_time_top[tid] = now
-            if abs(cy - LINE_Y_BOT) < 15:
-                if tid not in self.pass_time_bot:
-                    self.pass_time_bot[tid] = now
-            if tid in self.pass_time_top and tid in self.pass_time_bot:
-                t_top = self.pass_time_top[tid]
-                t_bot = self.pass_time_bot[tid]
-                dt = abs(t_bot - t_top)
-                if 0.1 < dt < 10.0:
-                    speed_ms = REAL_DISTANCE_M / dt
-                    speed_kmh = speed_ms * 3.6
-                    if 5 < speed_kmh < 200:
-                        self.speeds[tid] = round(speed_kmh, 1)
-                        new_speeds[tid] = self.speeds[tid]
+            active_tids.add(tid)
+            if tid not in self._track_data:
+                self._track_data[tid] = {
+                    'start_cx': cx, 'start_cy': cy,
+                    'start_frame': self._current_frame,
+                    'last_cx': cx, 'last_cy': cy,
+                    'frames': 1
+                }
+            else:
+                td = self._track_data[tid]
+                td['last_cx'] = cx
+                td['last_cy'] = cy
+                td['frames'] += 1
+                # 仅当该车辆尚未测速时才计算
+                if tid not in self.speeds:
+                    dx = cx - td['start_cx']
+                    dy = cy - td['start_cy']
+                    displacement = (dx * dx + dy * dy) ** 0.5
+                    frame_span = self._current_frame - td['start_frame']
+                    if displacement >= self.MIN_DISPLACEMENT and frame_span >= self.MIN_TRACK_FRAMES:
+                        elapsed = frame_span / fps
+                        if elapsed > 0:
+                            dist_m = displacement / self.PX_PER_M
+                            speed_ms = dist_m / elapsed
+                            speed_kmh = speed_ms * 3.6
+                            if 5 < speed_kmh < 250:
+                                self.speeds[tid] = round(speed_kmh, 1)
+                                new_speeds[tid] = self.speeds[tid]
+
+        # 清理不再活跃的轨迹
+        stale = [tid for tid in self._track_data if tid not in active_tids]
+        for tid in stale:
+            del self._track_data[tid]
 
         return new_speeds
 
     def get_speed(self, tid):
-        """获取指定 ID 的车速，未测到则返回 None"""
         return self.speeds.get(tid)
 
-    def get_tracked_with_speed(self, detections):
-        """
-        完整处理一帧：跟踪 + 速度计算。
-        返回: [(cx, cy, cls_name, track_id, speed_or_None), ...]
-        """
+    def reset(self):
+        """重置跟踪器（视频循环时调用）"""
+        self._track_data.clear()
+        self._prev_centroids.clear()
+        self._current_frame = 0
+
+    def get_tracked_with_speed(self, detections, fps=24.0):
         tracked = self._assign_ids(detections)
-        self.update(detections)
+        new_speeds = self.update(tracked, fps)
         result = []
         for cx, cy, cls_name, tid in tracked:
             spd = self.get_speed(tid)
             result.append((cx, cy, cls_name, tid, spd))
-        return result
+        return result, new_speeds
 
 
 # ============================================================
@@ -281,6 +286,7 @@ class DetectionEngine:
         self.tracker = VehicleTracker()
         self.heatmap = None
         self.mode = "speed"  # "speed" / "heatmap" / "distance" / "smoke"
+        self._video_fps = 24.0
         # 黑烟统计累计数据
         self._smoke_exceed_vehicles = 0   # 超标车辆总数（跨帧累加）
         self._smoke_exceed_frames = 0     # 出现超标的总帧数
@@ -312,7 +318,7 @@ class DetectionEngine:
         return detections
 
     def process_frame(self, frame):
-        """处理一帧：执行检测 + 根据当前模式渲染结果"""
+        """处理一帧：执行检测 + 追踪 + 速度计算 + 根据当前模式渲染"""
         h, w = frame.shape[:2]
         if self.heatmap is None:
             self.heatmap = HeatmapGenerator(w, h)
@@ -320,8 +326,16 @@ class DetectionEngine:
         detections = self.detect_vehicles(frame)
         det_for_track = [(cx, cy, cls) for cx, cy, cls, _ in detections]
 
+        # 每帧都做跟踪和测速，保证速度数据持续更新
+        fps = self._video_fps if hasattr(self, '_video_fps') and self._video_fps > 0 else 24.0
+        tracked, new_speeds = self.tracker.get_tracked_with_speed(det_for_track, fps)
+        for tid, spd in new_speeds.items():
+            self._speed_sum_all += spd
+            self._speed_count_all += 1
+        self._total_vehicles_all = max(self._total_vehicles_all, self.tracker._next_id)
+
         if self.mode == "speed":
-            return self._render_speed(frame, detections, det_for_track)
+            return self._render_speed(frame, detections, tracked)
         elif self.mode == "distance":
             return self._render_distance(frame, detections, det_for_track)
         elif self.mode == "smoke":
@@ -329,19 +343,8 @@ class DetectionEngine:
         else:
             return self._render_heatmap(frame, detections, det_for_track)
 
-    def _render_speed(self, frame, detections, det_for_track):
+    def _render_speed(self, frame, detections, tracked):
         """车速检测模式渲染"""
-        # 记录本帧之前已统计过的车速 ID，避免重复累加
-        speed_ids_before = set(self.tracker.speeds.keys())
-
-        tracked = self.tracker.get_tracked_with_speed(det_for_track)
-
-        # 将本帧新测到的车速累加到引擎全局统计
-        for tid, spd in self.tracker.speeds.items():
-            if tid not in speed_ids_before:
-                self._speed_sum_all += spd
-                self._speed_count_all += 1
-
         bbox_map = {}
         for i, (cx, cy, cls_name, _) in enumerate(detections):
             for tcx, tcy, _, tid, _ in tracked:
@@ -350,16 +353,6 @@ class DetectionEngine:
                     break
 
         overlay = frame.copy()
-
-        # 绘制两条蓝色测速线
-        cv2.line(overlay, (0, LINE_Y_TOP), (frame.shape[1], LINE_Y_TOP),
-                 LINE_COLOR, LINE_THICKNESS)
-        cv2.line(overlay, (0, LINE_Y_BOT), (frame.shape[1], LINE_Y_BOT),
-                 LINE_COLOR, LINE_THICKNESS)
-        cv2.putText(overlay, "LINE-1", (10, LINE_Y_TOP - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, LINE_COLOR, 2)
-        cv2.putText(overlay, "LINE-2", (10, LINE_Y_BOT - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, LINE_COLOR, 2)
 
         # 绘制每个车辆的检测框和速度
         for cx, cy, cls_name, tid, spd in tracked:
@@ -378,9 +371,6 @@ class DetectionEngine:
             cv2.rectangle(overlay, (x1, y1 - th - 8), (x1 + tw + 4, y1), (0, 255, 255), -1)
             cv2.putText(overlay, label, (x1 + 2, y1 - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-
-        # 累计通行车辆（用 tracker 最大 ID 代表总通过数）
-        self._total_vehicles_all = max(self._total_vehicles_all, self.tracker._next_id)
 
         info = f"MODE: SPEED | Vehicles: {len(tracked)}"
         cv2.putText(overlay, info, (10, 30),
@@ -405,8 +395,8 @@ class DetectionEngine:
         overlay = frame.copy()
         h, w = frame.shape[:2]
 
-        # 像素 → 米 的换算比例（复用测速线参数）
-        px_to_m = REAL_DISTANCE_M / PIXEL_DISTANCE if PIXEL_DISTANCE > 0 else 0.1
+        # 像素 → 米 的换算比例（基于摄像头参数估算）
+        px_to_m = 1.5 * 1000 / (h * 100) if h > 0 else 0.1
 
         if len(detections) < 2:
             # 车辆不足 2 辆，无法计算车距，仅画框
@@ -681,6 +671,7 @@ class VideoStreamer:
         w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.engine._video_fps = fps
         print(f"[视频] {os.path.basename(path)} | {w}x{h} @ {fps:.1f}fps, 共 {total} 帧")
         return True
 
@@ -693,8 +684,9 @@ class VideoStreamer:
 
             ret, frame = self._cap.read()
             if not ret:
-                # 视频播放完毕，循环
+                # 视频播放完毕，循环：重置跟踪器以重新测速
                 self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                self.engine.tracker.reset()
                 continue
 
             # YOLO 检测 + 渲染
