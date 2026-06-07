@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <title>智能车辆检测系统 - 实时检测</title>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0d1117; color: #e6edf3; font-family: 'Microsoft YaHei', sans-serif; }
+
+        .header {
+            background: linear-gradient(135deg, #161b22, #0f3460);
+            padding: 16px 28px; display: flex; align-items: center; justify-content: space-between;
+        }
+        .header h1 { font-size: 20px; font-weight: 700; }
+        .status { display: flex; gap: 16px; font-size: 13px; color: #8ecae6; align-items: center; }
+        .dot { width: 8px; height: 8px; border-radius: 50%; background: #4ade80; display: inline-block; animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .4 } }
+        .traffic-badge { padding: 4px 14px; border-radius: 20px; font-size: 13px; font-weight: 700; }
+
+        .main { display: flex; gap: 16px; padding: 16px; max-width: 1400px; margin: 0 auto; }
+        .video-box { flex: 1; background: #161b22; border-radius: 12px; overflow: hidden; position: relative; }
+        .video-box img { width: 100%; display: block; }
+        .traffic-overlay {
+            position: absolute; top: 12px; left: 12px;
+            padding: 6px 16px; border-radius: 8px; font-size: 14px; font-weight: 700;
+            background: rgba(0,0,0,0.7); z-index: 10;
+        }
+
+        .panel {
+            width: 260px; background: #161b22; border-radius: 12px; padding: 16px;
+            display: flex; flex-direction: column; gap: 10px;
+        }
+        .panel h2 { font-size: 15px; color: #e2e8f0; border-bottom: 1px solid #2a3a5c; padding-bottom: 8px; text-align: center; }
+
+        .btn {
+            padding: 11px 14px; border: none; border-radius: 8px; font-size: 13px; font-weight: 600;
+            cursor: pointer; color: #fff; transition: .2s; text-decoration: none; display: block; text-align: center;
+        }
+        .btn:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,.3); }
+        .btn-s { background: linear-gradient(135deg, #1a73e8, #1557b0) }
+        .btn-s.on { box-shadow: 0 0 0 3px rgba(26,115,232,.5) }
+        .btn-d { background: linear-gradient(135deg, #f59e0b, #d97706) }
+        .btn-d.on { box-shadow: 0 0 0 3px rgba(245,158,11,.5) }
+        .btn-k { background: linear-gradient(135deg, #9333ea, #7c3aed) }
+        .btn-k.on { box-shadow: 0 0 0 3px rgba(147,51,234,.5) }
+        .btn-info { background: linear-gradient(135deg, #0969da, #0550ae); font-size: 12px; padding: 9px 12px; }
+        .btn-upload { background: linear-gradient(135deg, #3a7d44, #2d6334); width: 100%; font-size: 14px; padding: 12px; }
+
+        label { font-size: 12px; color: #94a3b8; margin-bottom: 2px; }
+        .info-box { background: #0f3460; border-radius: 8px; padding: 10px; font-size: 11px; color: #94a3b8; line-height: 1.8; }
+        .info-box b { color: #e2e8f0; }
+        kbd { background: #2a3a5c; border-radius: 3px; padding: 1px 5px; font-size: 10px; color: #94a3b8; border: 1px solid #3a4a6c; }
+
+        .dashboard { max-width: 1400px; margin: 0 auto; padding: 0 16px 16px; }
+        .dashboard h3 { font-size: 14px; color: #8ecae6; margin-bottom: 10px; border-left: 3px solid #8ecae6; padding-left: 10px; }
+        .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+        .card {
+            background: linear-gradient(145deg, #161b22, #1a1a2e); border-radius: 10px; padding: 14px;
+            border: 1px solid #2a3a5c; transition: .2s;
+        }
+        .card:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(0,0,0,.3); }
+        .card .cl { font-size: 11px; color: #64748b }
+        .card .cv { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+        .card .cu { font-size: 11px; color: #64748b; margin-top: 2px; }
+        .cb .cv { color: #60a5fa }
+        .cg .cv { color: #4ade80 }
+        .cr .cv { color: #f87171 }
+        .ca .cv { color: #fbbf24 }
+        .cp .cv { color: #c084fc }
+        .cc .cv { color: #22d3ee }
+        .cs .cv { color: #94a3b8 }
+
+        .extra-panels {
+            max-width: 1400px; margin: 0 auto; padding: 0 16px 16px;
+            display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+        }
+        .extra-box { background: #161b22; border-radius: 12px; padding: 16px; border: 1px solid #2a3a5c; }
+        .extra-box h3 { font-size: 14px; color: #8ecae6; margin-bottom: 10px; border-left: 3px solid #8ecae6; padding-left: 10px; }
+
+        .violation-item {
+            padding: 8px 12px; margin: 4px 0; border-radius: 8px; font-size: 12px;
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        .violation-item .v-tid { font-weight: 700; color: #e6edf3; }
+        .v-spd { color: #f87171; font-weight: 700; }
+        .v-dist { color: #fbbf24; font-weight: 700; }
+        .v-none { color: #4ade80; font-size: 13px; text-align: center; padding: 20px; }
+
+        .lane-bar { display: flex; height: 36px; border-radius: 8px; overflow: hidden; margin: 10px 0; }
+        .lane-bar div { display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; color: #0d1117; transition: width .5s; }
+        .lane-labels { display: flex; justify-content: space-between; font-size: 11px; color: #8b949e; }
+        #flowChart { width: 100%; height: 220px; }
+        .footer { text-align: center; padding: 12px; font-size: 11px; color: #475569; }
+
+        @media (max-width: 900px) {
+            .main { flex-direction: column; }
+            .panel { width: 100%; }
+            .cards { grid-template-columns: repeat(2, 1fr); }
+            .extra-panels { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="header">
+    <h1>智能车辆检测系统</h1>
+    <div class="status">
+        <span><i class="dot"></i> 实时运行中</span>
+        <span class="traffic-badge" id="trafficBadge" style="background:#22c55e;color:#0d1117">畅通</span>
+        <span id="modeLabel">模式：车速检测</span>
+        <span id="videoLabel">视频：未加载</span>
+    </div>
+</div>
+
+<div class="main">
+    <!-- 左侧: 视频画面 -->
+    <div class="video-box">
+        <img id="stream" src="/video_feed" alt="视频流">
+    </div>
+
+    <!-- 右侧: 控制面板 -->
+    <div class="panel">
+        <h2>控制面板</h2>
+
+        <label>检测模式</label>
+        <button class="btn btn-s on" onclick="switchMode('speed')">车速检测</button>
+        <button class="btn btn-d" onclick="switchMode('distance')">车距预警</button>
+        <button class="btn btn-k" onclick="switchMode('smoke')">黑烟检测</button>
+
+        <label>视频操作</label>
+        <form action="/upload" method="post" enctype="multipart/form-data" id="uf">
+            <input type="file" name="video" id="vf" accept="video/*" style="display:none" onchange="this.form.submit()">
+            <button type="button" class="btn btn-upload" onclick="document.getElementById('vf').click()">上传视频</button>
+        </form>
+
+        <label>数据查看</label>
+        <a class="btn btn-info" href="/realtime_speed" target="_blank">查看实时车速</a>
+        <a class="btn btn-info" href="/flow_data" target="_blank">查看车流数据</a>
+        <a class="btn btn-info" href="/car_type" target="_blank">查看车型统计</a>
+        <a class="btn btn-info" href="/history_speed" target="_blank">历史车速统计</a>
+        <a class="btn btn-info" href="/db_records" target="_blank">历史入库记录</a>
+        <a class="btn btn-info" href="/traffic_db" target="_blank">交通数据库</a>
+
+        <div class="info-box">
+            <b>快捷键</b><br>
+            <kbd>1</kbd> 车速 &nbsp; <kbd>2</kbd> 车距 &nbsp; <kbd>3</kbd> 黑烟
+        </div>
+    </div>
+</div>
+
+<!-- 底部: 实时数据统计 -->
+<div class="dashboard">
+    <h3>实时数据统计</h3>
+    <div class="cards">
+        <div class="card cb">
+            <div class="cl">累计通行车辆</div>
+            <div class="cv" id="sV">0</div>
+            <div class="cu">辆</div>
+        </div>
+        <div class="card cg">
+            <div class="cl">平均车速</div>
+            <div class="cv" id="sS">0</div>
+            <div class="cu">km/h</div>
+        </div>
+        <div class="card cr">
+            <div class="cl">累计危险车辆</div>
+            <div class="cv" id="sD">0</div>
+            <div class="cu">辆</div>
+        </div>
+        <div class="card ca">
+            <div class="cl">平均车距</div>
+            <div class="cv" id="sA">0</div>
+            <div class="cu">米</div>
+        </div>
+        <div class="card cp">
+            <div class="cl">黑烟超标</div>
+            <div class="cv" id="sK">0</div>
+            <div class="cu">辆次</div>
+        </div>
+        <div class="card cc">
+            <div class="cl">当前模式</div>
+            <div class="cv" id="sM" style="font-size:16px">--</div>
+            <div class="cu" id="sMK">--</div>
+        </div>
+        <div class="card cs">
+            <div class="cl">已处理帧数</div>
+            <div class="cv" id="sF">0</div>
+            <div class="cu">帧</div>
+        </div>
+        <div class="card cs">
+            <div class="cl">当前视频</div>
+            <div class="cv" id="sVid" style="font-size:13px">--</div>
+            <div class="cu"></div>
+        </div>
+    </div>
+</div>
+
+<!-- 底部: 违章提醒 + 车道流量 -->
+<div class="extra-panels">
+    <div class="extra-box">
+        <h3>实时违章提醒</h3>
+        <div id="violations"><div class="v-none">暂无违章</div></div>
+    </div>
+    <div class="extra-box">
+        <h3>车道流量统计</h3>
+        <div class="lane-bar" id="laneBar"></div>
+        <div class="lane-labels" id="laneLabels"></div>
+        <div id="flowChart"></div>
+    </div>
+</div>
+
+<div class="footer">
+    Powered by YOLOv8 + OpenCV + Flask | 按 <kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> 切换模式
+</div>
+
+<script>
+const modeNames = {speed:'车速检测', distance:'车距预警', smoke:'黑烟检测'};
+const modeBtnClass = {speed:'s', distance:'d', smoke:'k'};
+
+function switchMode(m) {
+    fetch('/api/switch_mode', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({mode: m})
+    }).then(r => r.json()).then(d => {
+        if (d.ok) {
+            document.getElementById('modeLabel').textContent = '模式：' + modeNames[m];
+            document.querySelectorAll('.btn-s,.btn-h,.btn-d,.btn-k').forEach(b => b.classList.remove('on'));
+            document.querySelector('.btn-' + modeBtnClass[m]).classList.add('on');
+        }
+    });
+}
+
+// 同步服务器端当前模式
+(function() {
+    fetch('/api/stats').then(function(r){return r.json()}).then(function(d){
+        if(d.mode_key && modeNames[d.mode_key]){
+            document.getElementById('modeLabel').textContent='模式：'+modeNames[d.mode_key];
+            document.querySelectorAll('.btn-s,.btn-h,.btn-d,.btn-k').forEach(function(b){b.classList.remove('on')});
+            var btn=document.querySelector('.btn-'+modeBtnClass[d.mode_key]);
+            if(btn) btn.classList.add('on');
+        }
+    });
+})();
+
+// ECharts 车道流量图
+var flowChart = null;
+function initChart() {
+    flowChart = echarts.init(document.getElementById('flowChart'));
+    var cats = Array.from({length: 31}, (_, i) => '-' + i + 's');
+    flowChart.setOption({
+        tooltip: { trigger: 'axis' },
+        legend: { data: ['总流量'], textStyle: { color: '#8b949e' }, top: 0 },
+        grid: { left: 50, right: 50, top: 30, bottom: 30 },
+        xAxis: { type: 'category', data: cats, axisLabel: { color: '#8b949e', fontSize: 10 }, axisLine: { lineStyle: { color: '#30363d' } } },
+        yAxis: [
+            { type: 'value', name: '车道', axisLabel: { color: '#8b949e' }, splitLine: { lineStyle: { color: '#21262d' } }, axisLine: { lineStyle: { color: '#30363d' } } },
+            { type: 'value', name: '总量', axisLabel: { color: '#8b949e' }, splitLine: { show: false }, axisLine: { lineStyle: { color: '#30363d' } } }
+        ],
+        series: [{
+            name: '总流量', type: 'line', yAxisIndex: 1, data: Array(31).fill(0), smooth: true,
+            lineStyle: { color: '#c084fc', width: 2 },
+            areaStyle: { color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1, colorStops: [{ offset: 0, color: 'rgba(192,132,252,0.2)' }, { offset: 1, color: 'rgba(192,132,252,0)' }] } },
+            itemStyle: { color: '#c084fc' }
+        }]
+    });
+    window.addEventListener('resize', () => flowChart.resize());
+}
+initChart();
+
+function refresh() {
+    fetch('/api/stats').then(r => r.json()).then(d => {
+        document.getElementById('sV').textContent = d.total_vehicles;
+        document.getElementById('sS').textContent = d.avg_speed;
+        document.getElementById('sD').textContent = d.danger_vehicles;
+        document.getElementById('sA').textContent = d.avg_distance;
+        document.getElementById('sK').textContent = d.smoke_exceed;
+        document.getElementById('sM').textContent = d.current_mode;
+        document.getElementById('sMK').textContent = d.mode_key;
+        document.getElementById('sF').textContent = d.total_frames;
+        document.getElementById('sVid').textContent = d.current_video || '--';
+        document.getElementById('videoLabel').textContent = '视频：' + (d.current_video || '未加载');
+
+        // 违章提醒
+        var violations = d.violations || [];
+        var vHtml = '';
+        if (violations.length === 0) {
+            vHtml = '<div class="v-none">暂无违章</div>';
+        } else {
+            for (var i = 0; i < violations.length; i++) {
+                var v = violations[i];
+                var vCls = v[1] === '超速' ? 'v-spd' : 'v-dist';
+                vHtml += '<div class="violation-item">'
+                    + '<span class="v-tid">#' + v[0] + '</span>'
+                    + '<span>' + v[1] + '</span>'
+                    + '<span class="' + vCls + '">' + v[2] + '</span></div>';
+            }
+        }
+        document.getElementById('violations').innerHTML = vHtml;
+
+        // 交通状态
+        var level = d.traffic_level || '畅通';
+        var color = d.traffic_color || '#22c55e';
+        var tb = document.getElementById('trafficBadge');
+        tb.textContent = level;
+        tb.style.background = color;
+        tb.style.color = '#0d1117';
+
+        // 车道流量图
+        if (d.lane_history && flowChart) {
+            var lh = d.lane_history;
+            var nLanes = (d.lane_names || []).length || 1;
+            var lColors = ['#3b82f6', '#22c55e', '#f59e0b', '#a855f7', '#ec4899', '#06b6d4', '#f97316', '#84cc16'];
+            var series = [];
+            for (var li = 0; li < nLanes; li++) {
+                series.push({
+                    name: (d.lane_names || [])[li] || '车道' + (li + 1),
+                    type: 'bar', stack: 'lane',
+                    data: lh.map(function(x) { return x['l' + li] || 0; }),
+                    itemStyle: { color: lColors[li % lColors.length] },
+                    barWidth: '25%'
+                });
+            }
+            series.push({
+                name: '总流量', type: 'line', yAxisIndex: 1,
+                data: lh.map(function(x) { return x.total || 0; }),
+                smooth: true,
+                lineStyle: { color: '#c084fc', width: 2 },
+                areaStyle: { color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1, colorStops: [{ offset: 0, color: 'rgba(192,132,252,0.2)' }, { offset: 1, color: 'rgba(192,132,252,0)' }] } },
+                itemStyle: { color: '#c084fc' }
+            });
+            var legNames = series.map(function(s) { return s.name; });
+            flowChart.setOption({ legend: { data: legNames }, series: series }, { replaceMerge: ['series'] });
+        }
+
+        // 车道条形图
+        var lNames = d.lane_names || ['车道1'];
+        var lCounts = d.lane_counts || [0];
+        var lPcts = d.lane_pcts || [0];
+        var lColors2 = ['#3b82f6', '#22c55e', '#f59e0b', '#a855f7', '#ec4899', '#06b6d4', '#f97316', '#84cc16'];
+        var barHtml = '', lblHtml = '';
+        for (var j = 0; j < lNames.length; j++) {
+            var c = lColors2[j % lColors2.length];
+            var cnt = lCounts[j] || 0;
+            var pct = lPcts[j] || 0;
+            barHtml += '<div style="width:' + Math.max(pct, 2) + '%;background:' + c + '">' + cnt + '</div>';
+            lblHtml += '<span style="color:' + c + '">' + lNames[j] + ': ' + cnt + '辆 (' + pct + '%)</span> ';
+        }
+        document.getElementById('laneBar').innerHTML = barHtml;
+        document.getElementById('laneLabels').innerHTML = lblHtml;
+    }).catch(function() {});
+}
+
+refresh();
+setInterval(refresh, 1000);
+
+// 快捷键
+document.addEventListener('keydown', function(e) {
+    if (e.key === '1') switchMode('speed');
+    else if (e.key === '2') switchMode('distance');
+    else if (e.key === '3') switchMode('smoke');
+});
+</script>
+
+</body>
+</html>
