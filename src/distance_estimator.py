@@ -1,102 +1,63 @@
 # -*- coding: utf-8 -*-
 """
 模块: 车距估算器
-功能: 基于单目相机测距原理，估算车辆到摄像头的距离以及同车道前后车距离
-原理: 利用针孔相机模型，通过边界框高度与距离的反比关系估算距离
+功能: 单目几何测距，分车型标定，EMA平滑
 """
 
 import numpy as np
 from .config import CONFIG
 
+VEHICLE_HEIGHTS = {
+    'car': 1.5, 'motorcycle': 1.2, 'bus': 3.2, 'truck': 3.0, 'vehicle': 1.5,
+}
+
 
 class DistanceEstimator:
-    """
-    单目测距器
-
-    使用经验公式: 距离 = K / 框高
-    其中 K 为标定常数，通过已知距离和对应框高确定
-    """
 
     def __init__(self, frame_h):
         self.frame_h = frame_h
-        # 标定常数: 在参考距离处，框高 * 距离 = 常数
-        # 假设在 10m 处，一辆普通轿车的框高约为 120 像素
-        self.K = CONFIG['focal_length'] * 1.5  # 经验标定值
+        self.focal = CONFIG['focal_length']
+        self.camera_h = CONFIG['camera_height']
+        self.alpha = CONFIG['dist_smooth_alpha']
+        self._smooth = {}
 
-    def estimate(self, box_h, box_y):
-        """
-        根据边界框高度和位置估算距离
+    def estimate(self, box_h, box_y, class_name='vehicle'):
+        if box_h < 10 or box_y < 1:
+            return 999.0
+        real_h = VEHICLE_HEIGHTS.get(class_name, 1.5)
+        d = self.focal * real_h / box_h
+        return max(1.0, min(d, 100.0))
 
-        参数:
-            box_h: 边界框高度 (像素)
-            box_y: 边界框底部 Y 坐标 (像素)
+    def estimate_smooth(self, vid, raw):
+        prev = self._smooth.get(vid, raw)
+        smoothed = self.alpha * raw + (1 - self.alpha) * prev
+        self._smooth[vid] = smoothed
+        return smoothed
 
-        返回:
-            估算距离 (米)
-        """
-        if box_h < 10:
-            return 999.0  # 框太小，认为很远
+    def cleanup(self, active_ids):
+        stale = [v for v in self._smooth if v not in active_ids]
+        for v in stale:
+            del self._smooth[v]
 
-        # 基础距离 = K / 框高
-        base_dist = self.K / box_h
-
-        # 透视修正: 框在画面底部 (近处) 时修正小，顶部 (远处) 时修正大
-        # 利用 Y 坐标位置做线性修正
-        y_ratio = box_y / self.frame_h
-        perspective_factor = 0.7 + 0.6 * (1 - y_ratio)  # 底部=0.7, 顶部=1.3
-
-        dist = base_dist * perspective_factor
-        return max(1.0, min(dist, 100.0))  # 限制在 1~100m 范围
-
-    def compute_safe_distance(self, speed_kmh):
-        """
-        根据当前车速计算安全车距
-
-        公式: 安全距离 = 基础距离 + 每km/h增量 × 速度
-        例如: 60km/h 时安全距离 = 20 + 0.3*60 = 38m
-
-        参数:
-            speed_kmh: 当前车速 (km/h)
-
-        返回:
-            安全距离 (米)
-        """
-        return CONFIG['safe_dist_base'] + CONFIG['safe_dist_per_kmh'] * speed_kmh
-
-    def find_leading_vehicle(self, vehicles, distances, lane_map):
-        """
-        对于每个车辆，找到同车道内前方最近的车辆
-
-        参数:
-            vehicles: 车辆列表
-            distances: 距离字典 {vid: dist_m}
-            lane_map: 车道映射 {vid: lane_id}
-
-        返回:
-            前车关系字典 {vid: leading_vid 或 None}
-        """
+    def find_leading(self, vehicles, distances, lane_map):
         leading = {}
         for v in vehicles:
             vid = v['id']
             v_lane = lane_map.get(vid, -1)
-            v_cy = v['center'][1]
-
-            # 在同车道车辆中，找 Y 坐标更小 (更远) 且最近的
-            best = None
-            best_gap = float('inf')
+            if v_lane < 0:
+                leading[vid] = None
+                continue
+            best, best_gap = None, float('inf')
             for u in vehicles:
-                uid = u['id']
-                if uid == vid:
+                if u['id'] == vid:
                     continue
-                if lane_map.get(uid, -1) != v_lane:
+                if lane_map.get(u['id'], -1) != v_lane:
                     continue
-                # 前车应该在画面上方 (Y 更小 = 距离更远)
-                if u['center'][1] < v_cy:
-                    gap = distances.get(vid, 999) - distances.get(uid, 999)
-                    if 0 < gap < best_gap:
-                        best_gap = gap
-                        best = uid
-
+                if u['center'][1] >= v['center'][1]:
+                    continue
+                gap = distances.get(vid, 999) - distances.get(u['id'], 999)
+                if 0 < gap < best_gap:
+                    best_gap = gap
+                    best = u['id']
             leading[vid] = best
-
         return leading

@@ -1,9 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 模块: 车速计算器
-功能: 基于双参考线法测量车辆速度
-原理: 在视频画面中设置两条水平参考线，跟踪车辆经过两条线的时间差，
-      利用公式 速度 = 距离 / 时间 计算车速
+功能: 基于像素位移的逐帧测速，带透视校正和平滑滤波
 """
 
 from .config import CONFIG
@@ -11,131 +9,119 @@ from .config import CONFIG
 
 class SpeedCalculator:
     """
-    双参考线测速器
+    逐帧测速器
 
     工作流程:
-    1. 在帧画面中画出两条水平蓝色参考线
-    2. 跟踪每个车辆中心点经过两条线的帧号
-    3. 车辆经过两条线后，计算速度并做平滑处理
-    4. 超过限速的车辆标记为红色
+    1. 每帧记录车辆中心坐标，保留最近N帧轨迹
+    2. 连续N帧位移<1像素 → 判定静止，显示0
+    3. 用最后5帧位移计算速度，透视校正后EMA平滑
     """
 
     def __init__(self, frame_h):
-        """
-        参数:
-            frame_h: 视频帧高度 (像素)，用于计算参考线 Y 坐标
-        """
         self.frame_h = frame_h
+        # {vid: [(frame_num, cx, cy), ...]}
+        self.tracks = {}
+        # {vid: smoothed_speed_kmh}
+        self.smoothed = {}
 
-        # 计算两条参考线的 Y 坐标 (像素)
-        self.line1_y = int(frame_h * CONFIG['speed_line1_y_ratio'])
-        self.line2_y = int(frame_h * CONFIG['speed_line2_y_ratio'])
+        self.track_len = CONFIG['speed_track_len']
+        self.window = CONFIG['speed_smooth_window']
+        self.static_frames = CONFIG['speed_static_frames']
+        self.static_px = CONFIG['speed_static_px']
+        self.alpha = CONFIG['speed_ema_alpha']
+        self.clamp_max = CONFIG['speed_clamp_max']
 
-        # 车辆跟踪数据: {vehicle_id: {'crossings': [...], 'speed': float, 'last_frame': int}}
-        self.tracker = {}
+        self.ppm_bottom = CONFIG['ppm_bottom']
+        self.ppm_top = CONFIG['ppm_top']
 
-        # 通过冷却帧数 (防止同一位置重复触发)
-        self.cooldown = CONFIG['speed_cooldown']
-
-        # 确认有效车速列表 (车辆成功穿过双线后记录)
-        self.confirmed_speeds = []
+    def _ppm_at_y(self, y):
+        """根据Y坐标返回透视校正后的每米像素数"""
+        ratio = max(0.0, min(1.0, y / self.frame_h))
+        return self.ppm_top + (self.ppm_bottom - self.ppm_top) * ratio
 
     def update(self, vehicles, frame_num, fps):
         """
-        更新车辆位置并计算速度
+        更新车辆位置，计算速度
 
-        参数:
-            vehicles: 车辆检测列表 (需包含 'id' 和 'center')
-            frame_num: 当前帧号
-            fps: 视频帧率
-
-        返回:
-            车辆速度字典 {vehicle_id: speed_kmh}
+        返回: {vid: speed_kmh}
         """
         speeds = {}
+        active_ids = set()
 
         for v in vehicles:
             vid = v['id']
-            cy = v['center'][1]  # 车辆中心 Y 坐标
+            active_ids.add(vid)
+            cx, cy = v['center']
 
-            # 初始化跟踪数据
-            if vid not in self.tracker:
-                self.tracker[vid] = {
-                    'crossings': [],     # 记录穿越事件
-                    'speed': 0,          # 当前平滑速度
-                    'last_calc_frame': 0  # 上次计算速度的帧号
-                }
+            # 记录轨迹
+            if vid not in self.tracks:
+                self.tracks[vid] = []
+            self.tracks[vid].append((frame_num, cx, cy))
+            if len(self.tracks[vid]) > self.track_len:
+                self.tracks[vid] = self.tracks[vid][-self.track_len:]
 
-            t = self.tracker[vid]
-            prev_cy = t.get('prev_cy', cy)
-            t['prev_cy'] = cy
+            history = self.tracks[vid]
+            n = len(history)
 
-            # 检测是否穿越参考线 (检查前一帧和当前帧是否跨越了线)
-            for line_idx, line_y in enumerate([self.line1_y, self.line2_y]):
-                # 跨越检测: 前一帧在线的一侧，当前帧在另一侧 (或在线上)
-                crossed = (prev_cy - line_y) * (cy - line_y) <= 0
-                # 也检测在附近的容差区域
-                near = abs(cy - line_y) < 30
+            if n < 2:
+                speeds[vid] = 0.0
+                continue
 
-                if crossed or near:
-                    # 检查冷却
-                    recent = [c for c in t['crossings']
-                              if c['line'] == line_idx
-                              and frame_num - c['frame'] < self.cooldown]
-                    if not recent:
-                        t['crossings'].append({
-                            'line': line_idx,
-                            'frame': frame_num,
-                            'y': cy
-                        })
+            # 静止判定
+            if n >= self.static_frames:
+                recent = history[-self.static_frames:]
+                all_static = True
+                for i in range(1, len(recent)):
+                    dx = recent[i][1] - recent[i - 1][1]
+                    dy = recent[i][2] - recent[i - 1][2]
+                    if (dx * dx + dy * dy) ** 0.5 >= self.static_px:
+                        all_static = False
+                        break
+                if all_static:
+                    self.smoothed[vid] = 0.0
+                    speeds[vid] = 0.0
+                    continue
 
-            # 检查是否可以计算速度 (两条线都穿越过)
-            line0_crossings = [c for c in t['crossings'] if c['line'] == 0]
-            line1_crossings = [c for c in t['crossings'] if c['line'] == 1]
+            # 需要足够帧数
+            if n < self.window:
+                speeds[vid] = self.smoothed.get(vid, 0.0)
+                continue
 
-            if line0_crossings and line1_crossings:
-                # 取最近的两次穿越
-                c0 = line0_crossings[-1]
-                c1 = line1_crossings[-1]
+            window = history[-self.window:]
+            f0, x0, y0 = window[0]
+            f1, x1, y1 = window[-1]
+            frame_gap = f1 - f0
+            if frame_gap <= 0:
+                speeds[vid] = self.smoothed.get(vid, 0.0)
+                continue
 
-                # 计算时间差 (秒)
-                dt_frames = abs(c1['frame'] - c0['frame'])
-                if dt_frames > 0 and fps > 0:
-                    dt_sec = dt_frames / fps
+            pixel_dist = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+            # 透视校正：用轨迹起点的Y坐标
+            ppm = self._ppm_at_y(y0)
+            speed_kmh = (pixel_dist / frame_gap) * fps / ppm * 3.6
 
-                    # 速度(km/h) = 距离(m) / 时间(s) × 3.6
-                    raw_speed = (CONFIG['line_real_dist'] / dt_sec) * 3.6
+            # 异常过滤
+            if speed_kmh < 0.5:
+                speed_kmh = 0.0
+            elif speed_kmh > self.clamp_max:
+                speed_kmh = self.clamp_max
 
-                    # 过滤异常值
-                    if CONFIG['speed_min'] <= raw_speed <= CONFIG['speed_max']:
-                        # 指数移动平均平滑
-                        alpha = CONFIG['speed_smooth_alpha']
-                        t['speed'] = alpha * t['speed'] + (1 - alpha) * raw_speed
-                        # 记录确认有效车速
-                        self.confirmed_speeds.append(t['speed'])
+            # EMA平滑
+            prev = self.smoothed.get(vid, speed_kmh)
+            smoothed = self.alpha * speed_kmh + (1 - self.alpha) * prev
+            self.smoothed[vid] = smoothed
+            speeds[vid] = round(smoothed, 1)
 
-                    # 清除已使用的穿越记录，避免重复计算
-                    t['crossings'] = []
-                    t['last_calc_frame'] = frame_num
-
-            speeds[vid] = t['speed']
-
-        # 清理长时间未出现的车辆
-        stale = [vid for vid, t in self.tracker.items()
-                 if frame_num - t.get('last_calc_frame', frame_num) > fps * 5]
+        # 清理消失车辆
+        stale = [vid for vid in self.tracks if vid not in active_ids]
         for vid in stale:
-            del self.tracker[vid]
+            del self.tracks[vid]
+            self.smoothed.pop(vid, None)
 
         return speeds
 
-    def get_line_positions(self):
-        """返回两条参考线的 Y 坐标 (用于绘制)，确保为 Python int"""
-        return int(self.line1_y), int(self.line2_y)
+    def get_speed(self, vid):
+        return self.smoothed.get(vid, 0.0)
 
     def is_overspeed(self, speed):
-        """判断是否超速"""
         return speed > CONFIG['speed_limit']
-
-    def get_confirmed_speeds(self):
-        """返回所有确认有效的车速列表 (车辆成功穿过双测速线)"""
-        return list(self.confirmed_speeds)

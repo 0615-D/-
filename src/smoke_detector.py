@@ -1,17 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-模块: 黑烟排放检测器
-功能: 基于林格曼黑度算法检测车辆尾气黑烟
-原理: 在车辆底部提取尾气 ROI 区域，进行灰度化和阈值分割，
-      计算暗色像素占比，匹配林格曼黑度等级 (0~5 级)
-
-林格曼黑度等级:
-  0 级: 全白 (无烟)
-  1 级: 浅灰 (20% 黑)
-  2 级: 中灰 (40% 黑)   ← 触发警报阈值
-  3 级: 深灰 (60% 黑)
-  4 级: 浓黑 (80% 黑)
-  5 级: 全黑 (100% 黑)
+模块: 黑烟检测器
+功能: 车尾区域黑烟检测，林格曼黑度分级，连续帧确认
+核心防误报: 车身灰度对比 + HSV饱和度检测 + 路面对比 + 连续帧确认
 """
 
 import cv2
@@ -20,137 +11,168 @@ from .config import CONFIG
 
 
 class SmokeDetector:
-    """
-    林格曼黑度黑烟检测器
-
-    检测流程:
-    1. 以车辆检测框底部为中心，向下扩展区域作为尾气 ROI
-    2. 对 ROI 区域灰度化、高斯模糊去噪
-    3. 阈值分割提取暗色像素 (黑烟)
-    4. 计算暗色像素占比，匹配林格曼黑度等级
-    5. 等级 >= 2 时判定为黑烟排放
-    """
-
-    # 不同灵敏度对应的参数
-    SENSITIVITY = {
-        'low':    {'dark_thresh': 40,  'min_ratio': 0.35, 'grade_scale': [0, 0.20, 0.40, 0.60, 0.80, 1.0]},
-        'medium': {'dark_thresh': 50,  'min_ratio': 0.25, 'grade_scale': [0, 0.15, 0.30, 0.50, 0.70, 1.0]},
-        'high':   {'dark_thresh': 60,  'min_ratio': 0.18, 'grade_scale': [0, 0.10, 0.20, 0.35, 0.55, 1.0]},
-    }
 
     def __init__(self, frame_w, frame_h):
         self.frame_w = frame_w
         self.frame_h = frame_h
+        self.debounce = CONFIG['smoke_debounce']
+        self.threshold = CONFIG['smoke_confidence']  # 0.7
+        self._counters = {}  # {vid: consecutive_frames}
 
-        # 加载灵敏度参数
-        sensitivity = CONFIG['smoke_sensitivity']
-        params = self.SENSITIVITY.get(sensitivity, self.SENSITIVITY['medium'])
-        self.dark_thresh = params['dark_thresh']
-        self.min_ratio = params['min_ratio']
-        self.grade_scale = params['grade_scale']
-
-        # 每辆车的黑烟历史 (用于时间平滑，过滤短暂干扰)
-        self.history = {}  # {vid: [grade, grade, ...]}
-        self.history_len = 5
-
-    def detect(self, vehicle):
+    def detect(self, frame, vehicle):
         """
         检测单辆车的尾气黑烟
-
-        参数:
-            vehicle: 车辆信息 dict (需包含 'id', 'bbox', 'center')
-
-        返回:
-            {
-                'grade': int,       # 林格曼黑度等级 (0~5)
-                'ratio': float,     # 暗色像素占比 (0~1)
-                'has_smoke': bool,  # 是否触发黑烟警报
-                'roi': tuple        # 尾气 ROI 区域 (x1, y1, x2, y2) 或 None
-            }
+        返回: {'grade': int, 'ratio': float, 'has_smoke': bool, 'roi': tuple|None}
         """
         vid = vehicle['id']
         x1, y1, x2, y2 = vehicle['bbox']
-        bw = x2 - x1
-        bh = y2 - y1
+        bw, bh = x2 - x1, y2 - y1
 
-        # ===== Step 1: 提取尾气 ROI =====
-        # 以车辆底部为中心，向下扩展
-        expand_h = int(bh * CONFIG['smoke_roi_expand'])
-        roi_w = int(bw * CONFIG['smoke_roi_width_ratio'])
+        if bw < 20 or bh < 20:
+            return {'grade': 0, 'ratio': 0, 'has_smoke': False, 'roi': None}
 
-        # ROI 中心: 车辆底部中心
-        roi_cx = (x1 + x2) // 2
-        roi_cy = y2  # 车辆框底部
+        # ── 车尾区域：底部1/4高度，水平居中 ──
+        tail_h = max(1, bh // 4)
+        ry1 = max(0, y2 - tail_h)
+        ry2 = min(self.frame_h, y2 + tail_h // 3)
+        pad_x = max(1, int(bw * 0.10))
+        rx1 = max(0, x1 + pad_x)
+        rx2 = min(self.frame_w, x2 - pad_x)
 
-        # 计算 ROI 坐标
-        rx1 = max(0, roi_cx - roi_w // 2)
-        rx2 = min(self.frame_w, roi_cx + roi_w // 2)
-        ry1 = max(0, roi_cy)
-        ry2 = min(self.frame_h, roi_cy + expand_h)
-
-        # ROI 太小则跳过
         if ry2 - ry1 < 10 or rx2 - rx1 < 10:
             return {'grade': 0, 'ratio': 0, 'has_smoke': False, 'roi': None}
 
+        roi_img = frame[ry1:ry2, rx1:rx2]
+        if roi_img.size == 0:
+            return {'grade': 0, 'ratio': 0, 'has_smoke': False, 'roi': None}
+
         roi = (rx1, ry1, rx2, ry2)
+        gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
+        mean_val = float(np.mean(gray))
+        std_val = float(np.std(gray))
 
-        # ===== Step 2: 图像处理 =====
-        # 注意: 这里只接收 bbox 坐标，实际图像需要在调用方裁剪后传入
-        # 为了模块化，返回 ROI 坐标，由调用方完成裁剪和分析
-        return {'grade': 0, 'ratio': 0, 'has_smoke': False, 'roi': roi}
+        # ══════════════════════════════════════════
+        # 深色车身过滤（核心防误报逻辑）
+        # ══════════════════════════════════════════
 
-    def analyze_roi(self, roi_image, vid):
-        """
-        分析尾气 ROI 图像，计算黑烟等级
+        # ── 过滤1: 车身本体对比 ──
+        # 采样车辆上半部分车身灰度，如果尾部和车身一样暗，说明是车身不是烟
+        body_mean = self._sample_body_gray(frame, x1, y1, x2, y2)
+        if body_mean > 0:
+            # 尾部灰度 >= 车身灰度的 90% → 尾部并不比车身暗，是车身
+            if mean_val >= body_mean * 0.90:
+                return {'grade': 0, 'ratio': 0, 'has_smoke': False, 'roi': roi}
 
-        参数:
-            roi_image: 裁剪后的尾气区域图像 (BGR)
-            vid: 车辆 ID (用于历史平滑)
+        # ── 过滤2: 深色车身（宽范围） ──
+        # 灰度均值 < 70 → 很可能是深色车身/阴影
+        if mean_val < 70:
+            return {'grade': 0, 'ratio': 0, 'has_smoke': False, 'roi': roi}
 
-        返回:
-            (grade, ratio, has_smoke)
-        """
-        if roi_image is None or roi_image.size == 0:
-            return 0, 0.0, False
+        # ── 过滤3: HSV饱和度检测 ──
+        # 深色车漆即使很暗也有颜色饱和度，黑烟是无彩色的（饱和度极低）
+        # 如果饱和度较高 → 是有颜色的物体（车漆），不是烟
+        hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
+        sat_mean = float(np.mean(hsv[:, :, 1]))
+        if sat_mean > 35:
+            return {'grade': 0, 'ratio': 0, 'has_smoke': False, 'roi': roi}
 
-        # 灰度化
-        gray = cv2.cvtColor(roi_image, cv2.COLOR_BGR2GRAY)
+        # ── 过滤4: 均匀区域（阴影/路面） ──
+        if std_val < 12:
+            return {'grade': 0, 'ratio': 0, 'has_smoke': False, 'roi': roi}
 
-        # 高斯模糊去噪
+        # ── 过滤5: 亮色反光 ──
+        if mean_val > 200:
+            return {'grade': 0, 'ratio': 0, 'has_smoke': False, 'roi': roi}
+
+        # ── 过滤6: 路面对比 — 尾部必须明显暗于路面 ──
+        road_mean = self._sample_road_gray(frame, rx1, ry1, rx2, ry2, bw, bh)
+        if road_mean > 0 and mean_val > road_mean * 0.80:
+            return {'grade': 0, 'ratio': 0, 'has_smoke': False, 'roi': roi}
+
+        # ── 过滤7: 路面污渍/水渍 ──
+        if std_val < 20 and mean_val > 80:
+            return {'grade': 0, 'ratio': 0, 'has_smoke': False, 'roi': roi}
+
+        # ══════════════════════════════════════════
+        # 黑烟检测核心
+        # ══════════════════════════════════════════
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        # 计算暗色像素比例
-        # 暗色阈值: 低于此灰度值的像素认为是黑烟
-        dark_pixels = np.sum(gray < self.dark_thresh)
-        total_pixels = gray.size
-        ratio = dark_pixels / total_pixels if total_pixels > 0 else 0
+        # 动态阈值：基于局部均值
+        dark_thresh = max(50, int(mean_val * 0.45))
+        _, dark_mask = cv2.threshold(gray, dark_thresh, 255, cv2.THRESH_BINARY_INV)
 
-        # 匹配林格曼黑度等级
-        grade = 0
-        for g in range(5, -1, -1):
-            if ratio >= self.grade_scale[g]:
-                grade = g
+        # 形态学开运算去噪点
+        kernel = np.ones((3, 3), np.uint8)
+        dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, kernel)
+
+        total = dark_mask.shape[0] * dark_mask.shape[1]
+        ratio = cv2.countNonZero(dark_mask) / total if total > 0 else 0.0
+
+        # ── 置信度门槛：ratio >= 0.7 才认为有烟 ──
+        if ratio < self.threshold:
+            self._counters.pop(vid, None)
+            return {'grade': 0, 'ratio': ratio, 'has_smoke': False, 'roi': roi}
+
+        # 林格曼黑度等级
+        RINGELMANN = [(0.75, 1), (0.82, 2), (0.88, 3), (0.94, 4), (1.01, 5)]
+        grade = 1
+        for thresh, level in RINGELMANN:
+            if ratio < thresh:
+                grade = level
                 break
 
-        # 时间平滑: 使用历史记录过滤短暂干扰
-        if vid not in self.history:
-            self.history[vid] = []
+        # 连续帧确认（grade >= 2 才报警）
+        if grade >= 2:
+            cnt = self._counters.get(vid, 0) + 1
+            self._counters[vid] = cnt
+            has_smoke = cnt >= self.debounce
+        else:
+            self._counters.pop(vid, None)
+            has_smoke = False
 
-        self.history[vid].append(grade)
-        if len(self.history[vid]) > self.history_len:
-            self.history[vid].pop(0)
+        return {'grade': grade, 'ratio': ratio, 'has_smoke': has_smoke, 'roi': roi}
 
-        # 使用历史中位数作为最终等级 (过滤突变)
-        sorted_history = sorted(self.history[vid])
-        smoothed_grade = sorted_history[len(sorted_history) // 2]
+    def _sample_body_gray(self, frame, x1, y1, x2, y2):
+        """采样车辆上半部分车身的平均灰度（用于与尾部对比）"""
+        fh, fw = frame.shape[:2]
+        bh = y2 - y1
+        # 车身上半部分：从顶部往下 1/3 ~ 2/3 区域
+        body_top = max(0, y1 + bh // 4)
+        body_bot = max(0, y1 + bh * 2 // 3)
+        pad_x = max(1, int((x2 - x1) * 0.10))
+        bx1 = max(0, x1 + pad_x)
+        bx2 = min(fw, x2 - pad_x)
 
-        # 判断是否触发黑烟警报
-        has_smoke = smoothed_grade >= CONFIG['smoke_alert_grade']
+        if body_bot <= body_top or bx2 <= bx1:
+            return 0.0
 
-        return smoothed_grade, ratio, has_smoke
+        patch = frame[body_top:body_bot, bx1:bx2]
+        if patch.size == 0:
+            return 0.0
+        return float(np.mean(cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)))
+
+    def _sample_road_gray(self, frame, rx1, ry1, rx2, ry2, bw, bh):
+        """采样车辆两侧路面区域的平均灰度，用于对比"""
+        fh, fw = frame.shape[:2]
+        lx1 = max(0, rx1 - bw)
+        lx2 = max(0, rx1 - 5)
+        rlx1 = min(fw, rx2 + 5)
+        rlx2 = min(fw, rx2 + bw)
+
+        samples = []
+        if lx2 - lx1 > 10:
+            patch = frame[ry1:ry2, lx1:lx2]
+            if patch.size > 0:
+                samples.append(float(np.mean(cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY))))
+        if rlx2 - rlx1 > 10:
+            patch = frame[ry1:ry2, rlx1:rlx2]
+            if patch.size > 0:
+                samples.append(float(np.mean(cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY))))
+
+        return sum(samples) / len(samples) if samples else 0.0
 
     def cleanup(self, active_ids):
-        """清理不再活跃的车辆历史记录"""
-        stale = [vid for vid in self.history if vid not in active_ids]
-        for vid in stale:
-            del self.history[vid]
+        stale = [v for v in self._counters if v not in active_ids]
+        for v in stale:
+            del self._counters[v]

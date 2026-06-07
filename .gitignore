@@ -1,12 +1,33 @@
-# 屏蔽所有视频
+# 屏蔽所有视频文件
 *.mp4
 *.avi
+*.mov
+*.flv
+*.mkv
+
+# 屏蔽数据库文件
+*.db
+traffic.db
+vehicle.db
+
+# 屏蔽模型文件
+*.pt
+*.pth
+*.onnx
+
 # 输出目录
 output/
-# Python缓存
+uploads/
+
+# Python 缓存
 __pycache__/
 *.pyc
-# 环境与IDE
+*.pyo
+*.pyd
+
+# 环境与 IDE
 venv/
 .vscode/
 .idea/
+*.log
+*.tmp
